@@ -1,0 +1,1572 @@
+﻿=== FILE: C:\Users\stafi\PycharmProjects\warehouse_slotting\src\allocator.py ===
+"""
+Р”РІРёРіСѓРЅ Р°Р»РѕРєР°С†С–С—: СЂРѕР·РєР»Р°РґР°РЅРЅСЏ Р·Р° РїРѕРґРІС–Р№РЅРёРј С„Р°РєС‚РѕСЂРѕРј (РІР°РіР° + РѕР±'С”Рј РґРѕ 80%).
+"""
+
+from dataclasses import dataclass
+from typing import Dict, List, Set
+import pandas as pd
+
+from src.config import OVERSTOCK_THRESHOLDS
+from src.db import get_connection
+from src.models import ArmType, Rotation, ShelfSlot, ShelfType, SuspensionArmSKU
+from src.validator import validate_allocation
+
+TARGET_FILL_RATIO = 0.80
+
+
+@dataclass
+class AllocationRecord:
+    slot_id: str
+    sku_id: str
+    quantity: int
+    total_weight_kg: float
+    total_volume_l: float
+
+
+@dataclass
+class OverstockRecord:
+    sku_id: str
+    quantity: int
+    total_weight_kg: float
+    rotation: str
+
+
+class WarehouseAllocator:
+    def __init__(self):
+        self.conn = get_connection()
+        self.shelves: Dict[str, ShelfSlot] = {}
+        self.shelf_skus: Dict[str, Set[str]] = {}
+        self.shelf_rotations: Dict[str, Set[Rotation]] = {}
+        self.allocations: List[AllocationRecord] = []
+        self.overstock_list: List[OverstockRecord] = []
+
+    def load_state(self) -> List[SuspensionArmSKU]:
+        df_shelves = pd.read_sql(
+            """
+            SELECT slot_id, rack_id, tier, shelf_type, max_weight_kg, 
+                   current_weight_kg, max_volume_l, current_volume_l, 
+                   entry_height_cm, is_boxed_only, is_blocked, distance_cost 
+            FROM shelves 
+            WHERE is_blocked = 0 
+            ORDER BY distance_cost ASC
+            """,
+            self.conn,
+        )
+
+        for _, r in df_shelves.iterrows():
+            slot = ShelfSlot(
+                slot_id=r["slot_id"],
+                rack_id=int(r["rack_id"]),
+                tier=r["tier"],
+                shelf_type=ShelfType(r["shelf_type"]),
+                max_weight_kg=float(r["max_weight_kg"]),
+                max_volume_l=float(r["max_volume_l"]),
+                entry_height_cm=float(r["entry_height_cm"]),
+                is_boxed_only=bool(r["is_boxed_only"]),
+                is_blocked=bool(r["is_blocked"]),
+                allowed_rotations=set(),
+            )
+            self.shelves[slot.slot_id] = slot
+            self.shelf_skus[slot.slot_id] = set()
+            self.shelf_rotations[slot.slot_id] = set()
+
+        df_sku = pd.read_sql(
+            """
+            SELECT * FROM sku_catalog 
+            ORDER BY 
+                CASE effective_rotation 
+                    WHEN 'R1' THEN 1 
+                    WHEN 'R2' THEN 2 
+                    WHEN 'R3' THEN 3 
+                    WHEN 'RN' THEN 4 
+                    WHEN 'R4' THEN 5 
+                    WHEN 'R5' THEN 6 
+                END ASC,
+                batch_weight_kg DESC
+            """,
+            self.conn,
+        )
+
+        skus = []
+        for _, r in df_sku.iterrows():
+            skus.append(
+                SuspensionArmSKU(
+                    sku_id=r["sku_id"],
+                    name=r["name"],
+                    pair_sku_id=r["pair_sku_id"],
+                    side=r["side"],
+                    arm_type=ArmType(r["arm_type"]),
+                    is_boxed=bool(r["is_boxed"]),
+                    length_cm=float(r["length_cm"]),
+                    width_cm=float(r["width_cm"]),
+                    height_cm=float(r["height_cm"]),
+                    weight_kg=float(r["weight_kg"]),
+                    unit_volume_l=float(r["unit_volume_l"]),
+                    effective_volume_l=float(r["effective_volume_l"]),
+                    rotation=Rotation(r["rotation"]),
+                    effective_rotation=Rotation(r["effective_rotation"]),
+                    sales_median_6m=float(r["sales_median_6m"]),
+                    target_stock_qty=int(r["target_stock_qty"]),
+                    batch_weight_kg=float(r["batch_weight_kg"]),
+                    batch_volume_l=float(r["batch_volume_l"]),
+                )
+            )
+        return skus
+
+    def allocate(self):
+        skus = self.load_state()
+        all_slots = list(self.shelves.values())
+
+        for sku in skus:
+            is_thin_compatible = (
+                sku.arm_type == ArmType.STRAIGHT_LINK or
+                (sku.arm_type == ArmType.CURVED and sku.length_cm <= 34.0)
+            )
+
+            if is_thin_compatible:
+                candidate_slots = [s for s in all_slots if s.shelf_type == ShelfType.THIN_SLOT] + [s for s in all_slots if s.shelf_type != ShelfType.THIN_SLOT]
+            elif sku.effective_rotation == Rotation.R1:
+                candidate_slots = [s for s in all_slots if s.current_weight_kg == 0 and s.shelf_type in [ShelfType.DEEP_800, ShelfType.CONTINUOUS_300, ShelfType.DEEP_BOX]] + all_slots
+            else:
+                candidate_slots = all_slots
+
+            best_slot_id = None
+            placed_qty = 0
+
+            for slot in candidate_slots:
+                slot_id = slot.slot_id
+                free_w = max(0.0, (slot.max_weight_kg * TARGET_FILL_RATIO) - slot.current_weight_kg)
+                free_v = max(0.0, (slot.max_volume_l * TARGET_FILL_RATIO) - slot.current_volume_l)
+
+                if free_w < sku.weight_kg or free_v < sku.effective_volume_l:
+                    continue
+
+                by_w = int(free_w // sku.weight_kg)
+                by_v = int(free_v // sku.effective_volume_l) if sku.effective_volume_l > 0 else 999
+                test_qty = min(sku.target_stock_qty, by_w, by_v)
+
+                if sku.rotation == Rotation.RN or sku.effective_rotation == Rotation.RN:
+                    test_qty = min(test_qty, 5)
+
+                if test_qty <= 0:
+                    continue
+
+                is_valid, _ = validate_allocation(
+                    sku, test_qty, slot, self.shelf_skus[slot_id], self.shelf_rotations[slot_id]
+                )
+                if is_valid:
+                    best_slot_id = slot_id
+                    placed_qty = test_qty
+                    break
+
+            if best_slot_id:
+                slot = self.shelves[best_slot_id]
+                added_w = round(placed_qty * sku.weight_kg, 2)
+                added_v = round(placed_qty * sku.effective_volume_l, 2)
+
+                slot.current_weight_kg += added_w
+                slot.current_volume_l += added_v
+                self.shelf_skus[best_slot_id].add(sku.sku_id)
+                self.shelf_rotations[best_slot_id].add(sku.effective_rotation)
+
+                self.allocations.append(
+                    AllocationRecord(best_slot_id, sku.sku_id, placed_qty, added_w, added_v)
+                )
+
+                excess_qty = sku.target_stock_qty - placed_qty
+                if excess_qty > 0:
+                    is_rn = (sku.rotation == Rotation.RN or sku.effective_rotation == Rotation.RN)
+                    threshold = OVERSTOCK_THRESHOLDS["new"] if is_rn else OVERSTOCK_THRESHOLDS["slow"]
+                    if excess_qty >= threshold:
+                        self.overstock_list.append(
+                            OverstockRecord(
+                                sku.sku_id, excess_qty, round(excess_qty * sku.weight_kg, 2), sku.rotation.value
+                            )
+                        )
+            else:
+                self.overstock_list.append(
+                    OverstockRecord(
+                        sku.sku_id, sku.target_stock_qty, round(sku.target_stock_qty * sku.weight_kg, 2), sku.rotation.value
+                    )
+                )
+
+    def save_results(self):
+        with self.conn:
+            self.conn.execute("DELETE FROM inventory;")
+            self.conn.execute("DELETE FROM overstock;")
+            self.conn.executemany(
+                "INSERT INTO inventory (slot_id, sku_id, quantity) VALUES (?, ?, ?)",
+                [(a.slot_id, a.sku_id, a.quantity) for a in self.allocations],
+            )
+            self.conn.executemany(
+                "INSERT INTO overstock (sku_id, quantity, total_weight_kg, rotation) VALUES (?, ?, ?, ?)",
+                [(o.sku_id, o.quantity, o.total_weight_kg, o.rotation) for o in self.overstock_list],
+            )
+            for s in self.shelves.values():
+                self.conn.execute(
+                    "UPDATE shelves SET current_weight_kg = ?, current_volume_l = ? WHERE slot_id = ?",
+                    (round(s.current_weight_kg, 2), round(s.current_volume_l, 2), s.slot_id),
+                )
+
+    def close(self):
+        if self.conn:
+            self.conn.close()
+
+    def print_summary(self):
+        total_target_pcs = sum(r[0] for r in self.conn.execute("SELECT SUM(target_stock_qty) FROM sku_catalog").fetchall())
+        placed_pcs = sum(a.quantity for a in self.allocations)
+        overstock_pcs = sum(o.quantity for o in self.overstock_list)
+        occupied_shelves = sum(1 for s in self.shelves.values() if s.current_weight_kg > 0)
+
+        ratios_w = [s.current_weight_kg / s.max_weight_kg for s in self.shelves.values() if s.current_weight_kg > 0]
+        ratios_v = [s.current_volume_l / s.max_volume_l for s in self.shelves.values() if s.max_volume_l > 0 and s.current_volume_l > 0]
+
+        avg_w = (sum(ratios_w) / len(ratios_w)) * 100 if ratios_w else 0.0
+        avg_v = (sum(ratios_v) / len(ratios_v)) * 100 if ratios_v else 0.0
+
+        print("\n" + "=" * 55)
+        print("Р Р•Р—РЈР›Р¬РўРђРўР 2-Р¤РђРљРўРћР РќРћР‡ РђР›РћРљРђР¦Р†Р‡ (Р’РђР“Рђ + РљРЈР‘РђРўРЈР Рђ)")
+        print("=" * 55)
+        print(f"Р¦С–Р»СЊРѕРІРёР№ РїСѓР» РєР°С‚Р°Р»РѕРіСѓ:         {total_target_pcs:,} С€С‚.")
+        print(f"Р РѕР·РјС–С‰РµРЅРѕ РЅР° РїРѕР»РёС†СЏС… СЃРµРєС‚РѕСЂСѓ:  {placed_pcs:,} С€С‚. ({round(placed_pcs/total_target_pcs*100, 1)}%)")
+        print(f"Р‘СѓС„РµСЂ РЅР°РґСЃС‚Р°РЅС–РІ:               {overstock_pcs:,} С€С‚. ({round(overstock_pcs/total_target_pcs*100, 1)}%)")
+        print(f"Р—Р°РґС–СЏРЅРѕ РїРѕР»РёС†СЊ СЃРµРєС‚РѕСЂСѓ:        {occupied_shelves} С–Р· {len(self.shelves)} Р°РєС‚РёРІРЅРёС…")
+        print(f"РЎРµСЂРµРґРЅС” Р·Р°РІР°РЅС‚Р°Р¶РµРЅРЅСЏ Р·Р° РІР°РіРѕСЋ: {round(avg_w, 1)}% (Р»С–РјС–С‚ 80%)")
+        print(f"РЎРµСЂРµРґРЅС” Р·Р°РїРѕРІРЅРµРЅРЅСЏ Р·Р° РєСѓР±Р°С‚СѓСЂРѕСЋ:{round(avg_v, 1)}% (Р»С–РјС–С‚ 80%)")
+        print("=" * 55)
+
+=== FILE: C:\Users\stafi\PycharmProjects\warehouse_slotting\src\config.py ===
+"""
+РљРѕРЅС„С–РіСѓСЂР°С†С–СЏ СЃРєР»Р°РґСЃСЊРєРѕРіРѕ СЃРµРєС‚РѕСЂСѓ, Р»С–РјС–С‚С–РІ РІР°РіРё, РјС–СЃС‚РєРѕСЃС‚С– С‚Р° С‚РѕРїРѕР»РѕРіС–С‡РЅРёС… РјР°СЃРѕРє.
+"""
+
+DEFAULT_WEIGHT_BUFFER_KG = 25.0
+VERTICAL_CLEARANCE_CM = 4.0
+
+# Р РѕР±РѕС‡Р° РІР°РЅС‚Р°Р¶РѕРїС–РґР№РѕРјРЅС–СЃС‚СЊ РїРѕР»РёС†СЊ (РєРі)[cite: 4]
+WEIGHT_LIMITS = {
+    "deep_800": 275.0,        # Р СЏРґ 800 (001-005)[cite: 4]
+    "deep_box": 115.0,        # РЎРёРЅСЏ Р·РѕРЅР° (СЏСЂСѓСЃ A)[cite: 4]
+    "short_box": 45.0,        # Р—РµР»РµРЅС– РєРѕСЂРѕС‚РєС– СЏС‰РёРєРё (40 СЃРј)[cite: 4]
+    "thin_slot": 45.0,        # Р’СѓР·СЊРєС– СЃРёРЅС– Р±РѕРєСЃРё 001-009[cite: 4]
+    "continuous_300": 250.0   # РЎСѓС†С–Р»СЊРЅС– РІС–РґРєСЂРёС‚С– СЏСЂСѓСЃРё B, C[cite: 4]
+}
+
+# Р’Р°РЅС‚Р°Р¶РѕРїС–РґР№РѕРјРЅС–СЃС‚СЊ С„С–РѕР»РµС‚РѕРІРѕС— Р·РѕРЅРё (4 СЏСЂСѓСЃРё)[cite: 4]
+PURPLE_WEIGHT_LIMITS = {
+    "001-005": 200.0,
+    "A": 170.0,
+    "B": 140.0,
+    "C": 140.0
+}
+
+# Р¤С–Р·РёС‡РЅС– РѕР±'С”РјРё РєРѕРјС–СЂРѕРє (Р») Р·РіС–РґРЅРѕ Р· РіРµРѕРјРµС‚СЂС–С”СЋ РџР°СЃРїРѕСЂС‚Р°[cite: 4]
+SHELF_VOLUMES_L = {
+    "deep_800": 336.0,        # 80 x 60 x 70 СЃРј[cite: 4]
+    "continuous_300": 1056.0,  # 80 x 300 x 44 СЃРј[cite: 4]
+    "thin_slot": 92.4,        # 40 x 33 x 70 СЃРј[cite: 4]
+    "blue_a": 132.0,          # 40 x 60 x 55 СЃРј[cite: 4]
+    "short_box": 132.0,       # 40 x 60 x 55 СЃРј[cite: 4]
+    "purple_box": 264.0       # 80 x 60 x 55 СЃРј[cite: 4]
+}
+
+OVERSTOCK_THRESHOLDS = {
+    "fast": 5,
+    "slow": 3,
+    "new": 1  # Р”Р»СЏ RN РЅР°РґР»РёС€РѕРє РїРѕРЅР°Рґ 5 С€С‚. РѕРґСЂР°Р·Сѓ СЃРїСЂСЏРјРѕРІСѓС”С‚СЊСЃСЏ РІ overstock[cite: 4]
+}
+
+MAX_SKU_PER_STANDARD_BOX = 5
+MAX_SKU_PER_SLOW_BOX = 9
+
+ACCESS_WINDOW_BOX_CM = 55.0  # Р§РёСЃС‚Рµ РІС–РєРЅРѕ РґРѕСЃС‚СѓРїСѓ РґР»СЏ СЃС‚Р°РЅРґР°СЂС‚РЅРёС… Р±РѕРєСЃС–РІ
+ACCESS_CONTINUOUS_TIER_CM = 44.0 - VERTICAL_CLEARANCE_CM
+
+=== FILE: C:\Users\stafi\PycharmProjects\warehouse_slotting\src\db.py ===
+import math
+import sqlite3
+from pathlib import Path
+import pandas as pd
+
+from src.config import (
+    ACCESS_CONTINUOUS_TIER_CM,
+    PURPLE_WEIGHT_LIMITS,
+    SHELF_VOLUMES_L,
+    WEIGHT_LIMITS,
+)
+from src.models import ShelfType
+
+# РђРІС‚РѕРјР°С‚РёС‡РЅРµ РІРёР·РЅР°С‡РµРЅРЅСЏ РєРѕСЂРµРЅСЏ РїСЂРѕС”РєС‚Сѓ
+BASE_DIR = Path(__file__).resolve().parent.parent
+DB_PATH = BASE_DIR / "data" / "warehouse_v2.db"
+CSV_PATH = BASE_DIR / "data" / "suspension_arms.csv"
+
+
+def get_connection(timeout: float = 60.0) -> sqlite3.Connection:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, timeout=timeout)
+    # WAL РґРѕР·РІРѕР»СЏС” С‡РёС‚Р°С‚Рё Р· РІС–РєРЅР° Database С– РѕРґРЅРѕС‡Р°СЃРЅРѕ РїРёСЃР°С‚Рё Р·С– СЃРєР°РЅРµСЂР°:
+    conn.execute("PRAGMA journal_mode = WAL;")
+    conn.execute("PRAGMA busy_timeout = 60000;")
+    conn.execute("PRAGMA foreign_keys = ON;")
+    return conn
+
+
+def init_schema(conn: sqlite3.Connection) -> None:
+    # executescript РІРёРєРѕРЅСѓС”С‚СЊСЃСЏ Р±РµР· 'with conn:', РѕСЃРєС–Р»СЊРєРё СЃР°Рј РІС–РґРєСЂРёРІР°С” С‚Р° Р·Р°РєСЂРёРІР°С” С‚СЂР°РЅР·Р°РєС†С–СЋ
+    conn.executescript(
+        """
+        PRAGMA foreign_keys = OFF;
+        DROP TABLE IF EXISTS inventory;
+        DROP TABLE IF EXISTS overstock;
+        DROP TABLE IF EXISTS shelves;
+        DROP TABLE IF EXISTS sku_catalog;
+        PRAGMA foreign_keys = ON;
+
+        CREATE TABLE shelves (
+            slot_id TEXT PRIMARY KEY,
+            rack_id INTEGER NOT NULL,
+            tier TEXT NOT NULL,
+            box_number TEXT NOT NULL,
+            shelf_type TEXT NOT NULL,
+            max_weight_kg REAL NOT NULL,
+            current_weight_kg REAL DEFAULT 0.0,
+            max_volume_l REAL NOT NULL,
+            current_volume_l REAL DEFAULT 0.0,
+            entry_height_cm REAL NOT NULL,
+            is_boxed_only INTEGER NOT NULL,
+            is_blocked INTEGER NOT NULL,
+            distance_cost REAL NOT NULL
+        );
+
+        CREATE TABLE sku_catalog (
+            sku_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            pair_sku_id TEXT,
+            side TEXT NOT NULL,
+            arm_type TEXT NOT NULL,
+            is_boxed INTEGER NOT NULL,
+            length_cm REAL NOT NULL,
+            width_cm REAL NOT NULL,
+            height_cm REAL NOT NULL,
+            weight_kg REAL NOT NULL,
+            unit_volume_l REAL NOT NULL,
+            effective_volume_l REAL NOT NULL,
+            rotation TEXT NOT NULL,
+            effective_rotation TEXT NOT NULL,
+            sales_median_6m REAL NOT NULL,
+            target_stock_qty INTEGER NOT NULL,
+            batch_weight_kg REAL NOT NULL,
+            batch_volume_l REAL NOT NULL
+        );
+
+        CREATE TABLE inventory (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slot_id TEXT NOT NULL,
+            sku_id TEXT UNIQUE NOT NULL,
+            quantity INTEGER NOT NULL,
+            FOREIGN KEY (slot_id) REFERENCES shelves (slot_id),
+            FOREIGN KEY (sku_id) REFERENCES sku_catalog (sku_id)
+        );
+
+        CREATE TABLE overstock (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sku_id TEXT UNIQUE NOT NULL,
+            quantity INTEGER NOT NULL,
+            total_weight_kg REAL NOT NULL,
+            rotation TEXT NOT NULL,
+            FOREIGN KEY (sku_id) REFERENCES sku_catalog (sku_id)
+        );
+
+        CREATE INDEX idx_shelves_type ON shelves (shelf_type);
+        CREATE INDEX idx_shelves_blocked ON shelves (is_blocked);
+        CREATE INDEX idx_sku_rotation ON sku_catalog (effective_rotation);
+        """
+    )
+
+
+def calculate_distance_cost(rack_id: int, tier: str) -> float:
+    row_num = rack_id // 100
+    pos_num = rack_id % 100
+
+    row_distance = abs(row_num - 7.5) * 4.0
+    depth_distance = pos_num * 1.5
+    ground_dist = math.sqrt(row_distance**2 + depth_distance**2)
+
+    tier_penalties = {"A": 0.0, "001-005": 3.0, "001-009": 3.0, "B": 5.0, "C": 9.0}
+    return round(ground_dist + tier_penalties.get(tier, 4.0), 2)
+
+
+def generate_topology_shelves() -> list[dict]:
+    slots = []
+
+    # 1. РџР°СЂРЅРёР№ СЂСЏРґ 800 (800, 802 ... 820)
+    for rack in range(800, 821, 2):
+        dist_00 = calculate_distance_cost(rack, "001-005")
+        for b in range(1, 6):
+            slots.append({
+                "slot_id": f"{rack}-00{b}",
+                "rack_id": rack,
+                "tier": "001-005",
+                "box_number": f"00{b}",
+                "shelf_type": ShelfType.DEEP_800.value,
+                "max_weight_kg": WEIGHT_LIMITS["deep_800"],
+                "max_volume_l": SHELF_VOLUMES_L["deep_800"],
+                "entry_height_cm": 70.0,  # РїРѕРІРЅР° РІРёСЃРѕС‚Р° Р±РѕРєСЃСѓ
+                "is_boxed_only": 0,
+                "is_blocked": 0,
+                "distance_cost": dist_00
+            })
+
+        if rack == 806:
+            continue
+
+        # РЇСЂСѓСЃ Рђ РЅР° 804 РЅРµ РІРёРєРѕСЂРёСЃС‚РѕРІСѓС”С‚СЊСЃСЏ, РЅР° СЂРµС€С‚С– 800 вЂ” Р·Р°Р±Р»РѕРєРѕРІР°РЅРёР№
+        dist_a = calculate_distance_cost(rack, "A")
+        for b in range(1, 6):
+            slots.append({
+                "slot_id": f"{rack}-A0{b}",
+                "rack_id": rack,
+                "tier": "A",
+                "box_number": f"A0{b}",
+                "shelf_type": ShelfType.DEEP_BOX.value,
+                "max_weight_kg": 0.0,
+                "max_volume_l": 0.0,
+                "entry_height_cm": 55.0,
+                "is_boxed_only": 0,
+                "is_blocked": 1,
+                "distance_cost": 999.0
+            })
+
+        if rack == 804:
+            continue
+
+        for tier in ["B", "C"]:
+            slots.append({
+                "slot_id": f"{rack}-{tier}00",
+                "rack_id": rack,
+                "tier": tier,
+                "box_number": "300CM",
+                "shelf_type": ShelfType.CONTINUOUS_300.value,
+                "max_weight_kg": WEIGHT_LIMITS["continuous_300"],
+                "max_volume_l": SHELF_VOLUMES_L["continuous_300"],
+                "entry_height_cm": ACCESS_CONTINUOUS_TIER_CM,
+                "is_boxed_only": 1,
+                "is_blocked": 0,
+                "distance_cost": calculate_distance_cost(rack, tier)
+            })
+
+    # 2. РЎРёРЅСЏ Р·РѕРЅР° (801-821 РЅРµРїР°СЂРЅС– С‚Р° 700-720 РїР°СЂРЅС–)
+    blue_racks = list(range(801, 822, 2)) + list(range(700, 721, 2))
+    for rack in blue_racks:
+        for b in range(1, 10):
+            slots.append({
+                "slot_id": f"{rack}-00{b}",
+                "rack_id": rack,
+                "tier": "001-009",
+                "box_number": f"00{b}",
+                "shelf_type": ShelfType.THIN_SLOT.value,
+                "max_weight_kg": WEIGHT_LIMITS["thin_slot"],
+                "max_volume_l": SHELF_VOLUMES_L["thin_slot"],
+                "entry_height_cm": 70.0,
+                "is_boxed_only": 0,
+                "is_blocked": 0,
+                "distance_cost": calculate_distance_cost(rack, "001-009")
+            })
+
+        for b in range(1, 6):
+            slots.append({
+                "slot_id": f"{rack}-A0{b}",
+                "rack_id": rack,
+                "tier": "A",
+                "box_number": f"A0{b}",
+                "shelf_type": ShelfType.DEEP_BOX.value,
+                "max_weight_kg": WEIGHT_LIMITS["deep_box"],
+                "max_volume_l": SHELF_VOLUMES_L["blue_a"],
+                "entry_height_cm": 55.0,
+                "is_boxed_only": 0,
+                "is_blocked": 0,
+                "distance_cost": calculate_distance_cost(rack, "A")
+            })
+
+        slots.append({
+            "slot_id": f"{rack}-B00",
+            "rack_id": rack,
+            "tier": "B",
+            "box_number": "300CM",
+            "shelf_type": ShelfType.CONTINUOUS_300.value,
+            "max_weight_kg": WEIGHT_LIMITS["continuous_300"],
+            "max_volume_l": SHELF_VOLUMES_L["continuous_300"],
+            "entry_height_cm": ACCESS_CONTINUOUS_TIER_CM,
+            "is_boxed_only": 0,
+            "is_blocked": 0,
+            "distance_cost": calculate_distance_cost(rack, "B")
+        })
+
+        slots.append({
+            "slot_id": f"{rack}-C00",
+            "rack_id": rack,
+            "tier": "C",
+            "box_number": "300CM",
+            "shelf_type": ShelfType.CONTINUOUS_300.value,
+            "max_weight_kg": 0.0,
+            "max_volume_l": 0.0,
+            "entry_height_cm": ACCESS_CONTINUOUS_TIER_CM,
+            "is_boxed_only": 0,
+            "is_blocked": 1,
+            "distance_cost": 999.0
+        })
+
+    # 3. Р—РµР»РµРЅР° Р·РѕРЅР° (701-721, 600-620, 601-621, 500-520)
+    green_racks = (
+        list(range(701, 722, 2))
+        + list(range(600, 621, 2))
+        + list(range(601, 622, 2))
+        + list(range(500, 521, 2))
+    )
+    for rack in green_racks:
+        for tier in ["001-005", "A", "B"]:
+            prefix = "" if tier == "001-005" else f"{tier}0"
+            for b in range(1, 6):
+                box_num = f"00{b}" if tier == "001-005" else f"{prefix}{b}"
+                slots.append({
+                    "slot_id": f"{rack}-{box_num}",
+                    "rack_id": rack,
+                    "tier": tier,
+                    "box_number": box_num,
+                    "shelf_type": ShelfType.SHORT_BOX.value,
+                    "max_weight_kg": WEIGHT_LIMITS["short_box"],
+                    "max_volume_l": SHELF_VOLUMES_L["short_box"],
+                    "entry_height_cm": 55.0,
+                    "is_boxed_only": 0,
+                    "is_blocked": 0,
+                    "distance_cost": calculate_distance_cost(rack, tier)
+                })
+
+        for b in range(1, 6):
+            slots.append({
+                "slot_id": f"{rack}-C0{b}",
+                "rack_id": rack,
+                "tier": "C",
+                "box_number": f"C0{b}",
+                "shelf_type": ShelfType.SHORT_BOX.value,
+                "max_weight_kg": 0.0,
+                "max_volume_l": 0.0,
+                "entry_height_cm": 55.0,
+                "is_boxed_only": 0,
+                "is_blocked": 1,
+                "distance_cost": 999.0
+            })
+
+    # 4. Р¤С–РѕР»РµС‚РѕРІР° Р·РѕРЅР° (501-521, 400-420, 401-419 Р±РµР· 421)
+    purple_racks = (
+        list(range(501, 522, 2))
+        + list(range(400, 421, 2))
+        + list(range(401, 420, 2))
+    )
+    for rack in purple_racks:
+        for tier in ["001-005", "A", "B", "C"]:
+            tier_max_w = PURPLE_WEIGHT_LIMITS[tier]
+            prefix = "" if tier == "001-005" else f"{tier}0"
+            dist_cost = calculate_distance_cost(rack, tier)
+
+            for b in range(1, 6):
+                box_num = f"00{b}" if tier == "001-005" else f"{prefix}{b}"
+                slots.append({
+                    "slot_id": f"{rack}-{box_num}",
+                    "rack_id": rack,
+                    "tier": tier,
+                    "box_number": box_num,
+                    "shelf_type": ShelfType.DEEP_BOX.value,
+                    "max_weight_kg": tier_max_w,
+                    "max_volume_l": SHELF_VOLUMES_L["purple_box"],
+                    "entry_height_cm": 55.0,
+                    "is_boxed_only": 0,
+                    "is_blocked": 0,
+                    "distance_cost": dist_cost
+                })
+
+    return slots
+
+
+def setup_database():
+    print("Р†РЅС–С†С–Р°Р»С–Р·Р°С†С–СЏ СЃС‚СЂСѓРєС‚СѓСЂРё Р‘Р”...")
+    conn = get_connection()
+    try:
+        init_schema(conn)
+        print("Р“РµРЅРµСЂР°С†С–СЏ С‚РѕРїРѕР»РѕРіС–С‡РЅРѕС— РєР°СЂС‚Рё...")
+        shelves_data = generate_topology_shelves()
+        pd.DataFrame(shelves_data).to_sql("shelves", conn, if_exists="append", index=False)
+
+        if CSV_PATH.exists():
+            df_sku = pd.read_csv(CSV_PATH)
+            df_sku.to_sql("sku_catalog", conn, if_exists="append", index=False)
+            print(f"Р†РјРїРѕСЂС‚РѕРІР°РЅРѕ {len(df_sku):,} SKU.")
+        else:
+            print("CSV-С„Р°Р№Р» РЅРµ Р·РЅР°Р№РґРµРЅРѕ, СЃРїРѕС‡Р°С‚РєСѓ СЃС‚РІРѕСЂС–С‚СЊ РєР°С‚Р°Р»РѕРі С‡РµСЂРµР· generator.py")
+    finally:
+        conn.close()
+
+=== FILE: C:\Users\stafi\PycharmProjects\warehouse_slotting\src\generator.py ===
+"""
+РЎРёРЅС‚РµС‚РёС‡РЅРёР№ РіРµРЅРµСЂР°С‚РѕСЂ РґРµС‚Р°Р»РµР№ РїС–РґРІС–СЃРєРё Р· СЂРѕР·СЂР°С…СѓРЅРєРѕРј РѕР±'С”РјС–РІ Р·Р° РЅРѕРІРёРјРё С‚РёРїР°РјРё.
+"""
+
+import math
+import random
+from dataclasses import asdict
+from pathlib import Path
+from typing import List, Tuple
+import numpy as np
+import pandas as pd
+
+from src.models import ArmType, Rotation, SuspensionArmSKU, calculate_part_volume
+
+
+def get_arm_geometry(arm_type: ArmType) -> Tuple[float, float, float, float]:
+    if arm_type == ArmType.STRAIGHT_LINK:
+        l, w, h = np.random.uniform(18.0, 32.0), np.random.uniform(4.0, 7.5), np.random.uniform(4.0, 7.5)
+        weight = np.random.uniform(0.4, 1.4)
+    elif arm_type == ArmType.CURVED:
+        l, w, h = np.random.uniform(26.0, 42.0), np.random.uniform(10.0, 22.0), np.random.uniform(5.0, 11.0)
+        weight = np.random.uniform(1.6, 3.4)
+    elif arm_type == ArmType.A_SHAPED:
+        l, w, h = np.random.uniform(36.0, 52.0), np.random.uniform(26.0, 42.0), np.random.uniform(7.0, 15.0)
+        weight = np.random.uniform(3.6, 6.8)
+    elif arm_type == ArmType.TRAILING:
+        l, w, h = np.random.uniform(52.0, 78.0), np.random.uniform(6.0, 11.0), np.random.uniform(5.0, 9.0)
+        weight = np.random.uniform(2.1, 4.2)
+    else:  # HEAVY_INTEGRAL
+        l, w, h = np.random.uniform(50.0, 82.0), np.random.uniform(16.0, 26.0), np.random.uniform(10.0, 18.0)
+        weight = np.random.uniform(6.2, 10.5)
+
+    return round(l, 1), round(w, 1), round(h, 1), round(weight, 2)
+
+
+def generate_suspension_dataset(seed: int = 42) -> pd.DataFrame:
+    np.random.seed(seed)
+    random.seed(seed)
+    records: List[SuspensionArmSKU] = []
+    sku_counter = 1000
+
+    # РћРЅРѕРІР»РµРЅР° РєРѕРЅС„С–РіСѓСЂР°С†С–СЏ: 5 630 SKU (+1 500 РЅРѕРІРёС… РїРѕР·РёС†С–Р№)
+    config = [
+        # (Р РѕС‚Р°С†С–СЏ, РїР°СЂРЅС– РєРѕРјРїР»РµРєС‚Рё, СѓРЅС–РІРµСЂСЃР°Р»СЊРЅС– РґРµС‚Р°Р»С–, РґС–Р°РїР°Р·РѕРЅ РјРµРґС–Р°РЅРё РїСЂРѕРґР°Р¶С–РІ)
+        (Rotation.R1, 170, 40, (30, 48)),  # 170*2 + 40  = 380 SKU (+70)
+        (Rotation.R2, 440, 60, (18, 30)),  # 440*2 + 60  = 940 SKU (+220)
+        (Rotation.R3, 720, 90, (8, 16)),  # 720*2 + 90  = 1 530 SKU (+360)
+        (Rotation.R4, 880, 100, (3, 7)),  # 880*2 + 100 = 1 860 SKU (+480)
+        (Rotation.R5, 200, 40, (1, 2)),  # 200*2 + 40  = 440 SKU (+180)
+        (Rotation.RN, 200, 80, (0, 0)),  # 200*2 + 80  = 480 SKU (+190)
+    ]
+
+    for rot, n_pairs, n_uni, med_range in config:
+        for _ in range(n_pairs):
+            arm_type = random.choices(
+                list(ArmType), weights=[0.25, 0.20, 0.25, 0.20, 0.10], k=1
+            )[0]
+            is_boxed = np.random.rand() < 0.08
+            l, w, h, weight = get_arm_geometry(arm_type)
+            raw_v, eff_v = calculate_part_volume(l, w, h, arm_type, is_boxed)
+
+            if rot == Rotation.RN:
+                l_med = r_med = 0.0
+                l_qty = r_qty = int(np.random.randint(3, 6))
+            else:
+                base = np.random.uniform(*med_range)
+                l_med = round(base * np.random.uniform(0.96, 1.04), 1)
+                r_med = round(base * np.random.uniform(0.96, 1.04), 1)
+                l_qty, r_qty = math.ceil(1.5 * l_med), math.ceil(1.5 * r_med)
+
+            sku_l = f"SKU-{sku_counter}-LH"
+            sku_r = f"SKU-{sku_counter}-RH"
+            sku_counter += 1
+
+            for s_code, p_code, side, med, qty in [
+                (sku_l, sku_r, "LH", l_med, l_qty),
+                (sku_r, sku_l, "RH", r_med, r_qty)
+            ]:
+                records.append(
+                    SuspensionArmSKU(
+                        sku_id=s_code,
+                        name=f"Р’Р°Р¶С–Р»СЊ {arm_type.value} {side} ({rot.value})",
+                        pair_sku_id=p_code,
+                        side=side,
+                        arm_type=arm_type,
+                        is_boxed=is_boxed,
+                        length_cm=l,
+                        width_cm=w,
+                        height_cm=h,
+                        weight_kg=weight,
+                        unit_volume_l=raw_v,
+                        effective_volume_l=eff_v,
+                        rotation=rot,
+                        effective_rotation=rot,
+                        sales_median_6m=med,
+                        target_stock_qty=qty,
+                        batch_weight_kg=round(qty * weight, 1),
+                        batch_volume_l=round(qty * eff_v, 1),
+                    )
+                )
+
+        for _ in range(n_uni):
+            arm_type = random.choices([ArmType.STRAIGHT_LINK, ArmType.TRAILING], weights=[0.8, 0.2], k=1)[0]
+            is_boxed = np.random.rand() < 0.10
+            l, w, h, weight = get_arm_geometry(arm_type)
+            raw_v, eff_v = calculate_part_volume(l, w, h, arm_type, is_boxed)
+
+            if rot == Rotation.RN:
+                med_val, qty = 0.0, int(np.random.randint(2, 6))
+            else:
+                med_val = round(np.random.uniform(*med_range), 1)
+                qty = math.ceil(1.5 * med_val)
+
+            sku_uni = f"SKU-{sku_counter}-UNI"
+            sku_counter += 1
+
+            records.append(
+                SuspensionArmSKU(
+                    sku_id=sku_uni,
+                    name=f"РўСЏРіР°/СЃС‚С–Р№РєР° {arm_type.value} UNI ({rot.value})",
+                    pair_sku_id=None,
+                    side="UNI",
+                    arm_type=arm_type,
+                    is_boxed=is_boxed,
+                    length_cm=l,
+                    width_cm=w,
+                    height_cm=h,
+                    weight_kg=weight,
+                    unit_volume_l=raw_v,
+                    effective_volume_l=eff_v,
+                    rotation=rot,
+                    effective_rotation=rot,
+                    sales_median_6m=med_val,
+                    target_stock_qty=qty,
+                    batch_weight_kg=round(qty * weight, 1),
+                    batch_volume_l=round(qty * eff_v, 1),
+                )
+            )
+
+    return pd.DataFrame([asdict(r) for r in records])
+
+
+if __name__ == "__main__":
+    out = Path("data")
+    out.mkdir(parents=True, exist_ok=True)
+    df = generate_suspension_dataset()
+    df.to_csv(out / "suspension_arms.csv", index=False, encoding="utf-8")
+    print(f"РљР°С‚Р°Р»РѕРі Р·РіРµРЅРµСЂРѕРІР°РЅРѕ: {len(df):,} SKU")
+
+=== FILE: C:\Users\stafi\PycharmProjects\warehouse_slotting\src\models.py ===
+"""
+Р”РѕРјРµРЅРЅС– РјРѕРґРµР»С– РґР°РЅРёС… РґР»СЏ РґРµС‚Р°Р»РµР№ РїС–РґРІС–СЃРєРё С‚Р° РєРѕРјС–СЂРѕРє СЃРєР»Р°РґСѓ Р· СѓСЂР°С…СѓРІР°РЅРЅСЏРј РѕР±'С”РјС–РІ.
+"""
+
+from dataclasses import dataclass
+from enum import Enum
+from typing import Optional, Set, Tuple
+
+
+class ArmType(str, Enum):
+    STRAIGHT_LINK = "straight_link"    # РЎС‚С–Р№РєРё СЃС‚Р°Р±С–Р»С–Р·Р°С‚РѕСЂР°, РєРµСЂРјРѕРІС– РЅР°РєРѕРЅРµС‡РЅРёРєРё
+    TRAILING = "trailing"              # РџРѕР·РґРѕРІР¶РЅС– СЂРµР°РєС‚РёРІРЅС– С€С‚Р°РЅРіРё
+    CURVED = "curved"                  # РЎРµСЂРїРѕРїРѕРґС–Р±РЅС–, РґСѓРіРѕРІС– СЂРѕР·РІР°Р»СЊРЅС– С‚СЏРіРё
+    A_SHAPED = "a_shaped"              # РўСЂРёРєСѓС‚РЅС– РІР°Р¶РµР»С– McPherson (Wishbone)
+    HEAVY_INTEGRAL = "heavy_integral"  # РћРїРѕСЂРЅС– РІР°Р¶РµР»С– Р· С‡Р°С€РєРѕСЋ РїС–Рґ РїСЂСѓР¶РёРЅСѓ
+
+
+class Rotation(str, Enum):
+    RN = "RN"  # РќРѕРІРёР№ С‚РѕРІР°СЂ (Р»С–РјС–С‚ <= 5 С€С‚ РЅР° РїРѕР»РёС†С– РІС–РґР±РѕСЂСѓ)
+    R1 = "R1"  # РўРѕРї-РїРѕРїРёС‚
+    R2 = "R2"  # РЎС‚Р°Р±С–Р»СЊРЅС–
+    R3 = "R3"  # РЎРµСЂРµРґРЅС–
+    R4 = "R4"  # РџРѕРІС–Р»СЊРЅС–
+    R5 = "R5"  # РќРµР»С–РєРІС–Рґ
+
+
+class ShelfType(str, Enum):
+    SHORT_BOX = "short_box"            # Р—РµР»РµРЅС– Р±РѕРєСЃРё (40 СЃРј РіР»РёР±РёРЅР°)
+    DEEP_BOX = "deep_box"              # Р¤С–РѕР»РµС‚РѕРІС– (80 СЃРј) С‚Р° РЎРёРЅС– (40 СЃРј)
+    THIN_SLOT = "thin_slot"            # РЎРёРЅС– 001-009 (33 СЃРј С€РёСЂРёРЅР°)
+    DEEP_800 = "deep_800"              # Р СЏРґ 800 СЏСЂСѓСЃ 001-005 (80 СЃРј)
+    CONTINUOUS_300 = "continuous_300"  # Р’С–РґРєСЂРёС‚С– СЃСѓС†С–Р»СЊРЅС– РїРѕР»РёС†С– 300 СЃРј
+
+
+ARM_VOLUME_COEFFICIENTS = {
+    ArmType.STRAIGHT_LINK: 0.28,
+    ArmType.TRAILING: 0.38,
+    ArmType.CURVED: 0.42,
+    ArmType.A_SHAPED: 0.52,
+    ArmType.HEAVY_INTEGRAL: 0.68,
+}
+
+
+def calculate_part_volume(length_cm: float, width_cm: float, height_cm: float,
+                          arm_type: ArmType, is_boxed: bool) -> Tuple[float, float]:
+    """
+    Р Р°С…СѓС” РіР°Р±Р°СЂРёС‚РЅРёР№ РѕР±'С”Рј РєРѕСЂРѕР±РєРё С‚Р° РµС„РµРєС‚РёРІРЅРёР№ РѕР±'С”Рј РґРµС‚Р°Р»С– РІ Р»С–С‚СЂР°С….
+    """
+    raw_volume_l = round((length_cm * width_cm * height_cm) / 1000.0, 2)
+    if is_boxed:
+        effective_volume_l = round(raw_volume_l * 1.05, 2)
+    else:
+        coef = ARM_VOLUME_COEFFICIENTS.get(arm_type, 0.50)
+        effective_volume_l = round(raw_volume_l * coef, 2)
+    return raw_volume_l, max(0.1, effective_volume_l)
+
+
+@dataclass
+class SuspensionArmSKU:
+    sku_id: str
+    name: str
+    pair_sku_id: Optional[str]
+    side: str
+    arm_type: ArmType
+    is_boxed: bool
+    length_cm: float
+    width_cm: float
+    height_cm: float
+    weight_kg: float
+    unit_volume_l: float
+    effective_volume_l: float
+    rotation: Rotation
+    effective_rotation: Rotation
+    sales_median_6m: float
+    target_stock_qty: int
+    batch_weight_kg: float
+    batch_volume_l: float
+
+
+@dataclass
+class ShelfSlot:
+    slot_id: str
+    rack_id: int
+    tier: str
+    shelf_type: ShelfType
+    max_weight_kg: float
+    max_volume_l: float
+    entry_height_cm: float
+    is_boxed_only: bool
+    is_blocked: bool
+    allowed_rotations: Set[Rotation]
+    current_weight_kg: float = 0.0
+    current_volume_l: float = 0.0
+    current_skus: Set[str] = None
+
+    def __post_init__(self):
+        if self.current_skus is None:
+            self.current_skus = set()
+
+    @property
+    def free_weight_kg(self) -> float:
+        return max(0.0, self.max_weight_kg - self.current_weight_kg)
+
+    @property
+    def free_volume_l(self) -> float:
+        return max(0.0, self.max_volume_l - self.current_volume_l)
+
+=== FILE: C:\Users\stafi\PycharmProjects\warehouse_slotting\src\scanner.py ===
+"""
+РўРµСЂРјС–РЅР°Р» Motorola WMS Р· РјРµРЅСЋ РІ РјРµРЅСЋ РґР»СЏ СЂРµС”СЃС‚СЂР°С†С–С— РЅРѕРІРёС… РґРµС‚Р°Р»РµР№
+С‚Р° Р°РІС‚РѕРјР°С‚РёС‡РЅРёРј СЂРѕР·СЂР°С…СѓРЅРєРѕРј РєСѓР±Р°С‚СѓСЂРё Р·Р° С„С–Р·РёС‡РЅРёРј С‚РёРїРѕРј РІР°Р¶РµР»СЏ.
+"""
+
+import sys
+from typing import Optional, Tuple
+from src.db import get_connection
+from src.models import (
+    ArmType,
+    Rotation,
+    ShelfType,
+    calculate_part_volume,
+)
+
+TARGET_FILL_RATIO = 0.95
+
+
+class MotorolaFinalScanner:
+    def __init__(self):
+        self.conn = get_connection()
+
+    def lookup_sku(self, sku_id: str):
+        return self.conn.execute(
+            """
+            SELECT sku_id, name, arm_type, is_boxed, length_cm, width_cm, 
+                   height_cm, weight_kg, rotation, effective_volume_l
+            FROM sku_catalog WHERE sku_id = ?
+            """,
+            (sku_id,),
+        ).fetchone()
+
+    def register_new_sku_interactive(self, sku_id: str) -> Optional[tuple]:
+        print("\n" + "=" * 32, flush=True)
+        print("  Р Р•Р„РЎРўР РђР¦Р†РЇ РќРћР’РћР“Рћ РўРћР’РђР РЈ", flush=True)
+        print("=" * 32, flush=True)
+
+        print("\n[РњР•РќР® 1/3] Р“СЂСѓРїР° РІСѓР·Р»Р°:", flush=True)
+        print(" 1. РџРµСЂРµРґРЅСЏ РїС–РґРІС–СЃРєР° (Front)", flush=True)
+        print(" 2. Р—Р°РґРЅСЏ РїС–РґРІС–СЃРєР° (Rear)", flush=True)
+        print(" 3. Р СѓР»СЊРѕРІРµ СѓРїСЂР°РІР»С–РЅРЅСЏ С‚Р° СЃС‚Р°Р±С–Р»С–Р·Р°С‚РѕСЂ", flush=True)
+        group_choice = input("Р’РёР±РµСЂС–С‚СЊ РіСЂСѓРїСѓ [1-3]: ").strip()
+
+        arm_type = ArmType.A_SHAPED
+        if group_choice in ["1", "2"]:
+            print("\n[РњР•РќР® 2/3] Р¤РѕСЂРј-С„Р°РєС‚РѕСЂ РІР°Р¶РµР»СЏ:", flush=True)
+            print(" 1. РўСЂРёРєСѓС‚РЅРёР№ McPherson / Wishbone (A-РїРѕРґС–Р±РЅРёР№)", flush=True)
+            print(" 2. РЎРµСЂРїРѕРїРѕРґС–Р±РЅРёР№ / СЂРѕР·РІР°Р»СЊРЅР° С‚СЏРіР° (РґСѓРіРѕРІРёР№)", flush=True)
+            print(" 3. РџРѕР·РґРѕРІР¶РЅСЏ СЂРµР°РєС‚РёРІРЅР° С‚СЏРіР° (РґРѕРІРіР° С€С‚Р°РЅРіР°)", flush=True)
+            print(" 4. РћРїРѕСЂРЅРёР№ РІР°Р¶С–Р»СЊ Р· С‡Р°С€РєРѕСЋ РїС–Рґ РїСЂСѓР¶РёРЅСѓ", flush=True)
+            sub = input("Р’РёР±РµСЂС–С‚СЊ С‚РёРї [1-4]: ").strip()
+            type_map = {
+                "1": ArmType.A_SHAPED,
+                "2": ArmType.CURVED,
+                "3": ArmType.TRAILING,
+                "4": ArmType.HEAVY_INTEGRAL
+            }
+            arm_type = type_map.get(sub, ArmType.A_SHAPED)
+        else:
+            print("\n[РњР•РќР® 2/3] Р СѓР»СЊРѕРІРµ / Р»С–РЅРєРё:", flush=True)
+            print(" 1. РЎС‚С–Р№РєР° СЃС‚Р°Р±С–Р»С–Р·Р°С‚РѕСЂР° (РєС–СЃС‚РѕС‡РєР°)", flush=True)
+            print(" 2. РљРµСЂРјРѕРІР° С‚СЏРіР° / РЅР°РєРѕРЅРµС‡РЅРёРє", flush=True)
+            sub = input("Р’РёР±РµСЂС–С‚СЊ С‚РёРї [1-2]: ").strip()
+            arm_type = ArmType.STRAIGHT_LINK
+
+        print("\n[РњР•РќР® 3/3] РЎС‚РѕСЂРѕРЅР° РІСЃС‚Р°РЅРѕРІР»РµРЅРЅСЏ:", flush=True)
+        print(" 1. Р›С–РІРёР№ (LH) | 2. РџСЂР°РІРёР№ (RH) | 3. РЎРёРјРµС‚СЂРёС‡РЅРёР№ (UNI)", flush=True)
+        s_choice = input("РЎС‚РѕСЂРѕРЅР° [1-3]: ").strip()
+        side = "LH" if s_choice == "1" else ("RH" if s_choice == "2" else "UNI")
+
+        name = input("\nРќР°Р·РІР° РґРµС‚Р°Р»С– (Enter = Р’Р°Р¶С–Р»СЊ): ").strip()
+        if not name:
+            name = f"Р’Р°Р¶С–Р»СЊ {arm_type.value} {side}"
+
+        boxed_in = input("РЈ РєРѕСЂРѕР±С†С–? [1:РўР°Рє / 0:РќС– (РіРѕР»РёР№ РјРµС‚Р°Р»)] (Enter = 0): ").strip()
+        is_boxed = 1 if boxed_in == "1" else 0
+
+        print("\nР’РІРµРґС–С‚СЊ РіР°Р±Р°СЂРёС‚Рё РґРµС‚Р°Р»С– (СЃРј):", flush=True)
+        l = float(input("  Р”РѕРІР¶РёРЅР° (СЃРј): ") or 35.0)
+        w = float(input("  РЁРёСЂРёРЅР° (СЃРј): ") or 15.0)
+        h = float(input("  Р’РёСЃРѕС‚Р° (СЃРј): ") or 8.0)
+        weight_kg = float(input("  Р’Р°РіР° (РєРі): ") or 2.5)
+
+        raw_vol, eff_vol = calculate_part_volume(l, w, h, arm_type, bool(is_boxed))
+        print(f"\n>> Р РѕР·СЂР°С…СѓРЅРѕРє: РіР°Р±Р°СЂРёС‚РЅРёР№ РѕР±'С”Рј = {raw_vol} Р» | РµС„РµРєС‚РёРІРЅРёР№ = {eff_vol} Р»", flush=True)
+
+        print("\nР РѕС‚Р°С†С–СЏ: [1:RN (РќРѕРІРёР№)] [2:R1] [3:R2] [4:R3] [5:R4] [6:R5]", flush=True)
+        rot_choice = input("РћР±РµСЂС–С‚СЊ [1-6] (Enter=1): ").strip()
+        rot_map = {"1": "RN", "2": "R1", "3": "R2", "4": "R3", "5": "R4", "6": "R5"}
+        rotation = rot_map.get(rot_choice, "RN")
+
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO sku_catalog (
+                    sku_id, name, pair_sku_id, side, arm_type, is_boxed,
+                    length_cm, width_cm, height_cm, weight_kg,
+                    unit_volume_l, effective_volume_l, rotation,
+                    effective_rotation, sales_median_6m, target_stock_qty,
+                    batch_weight_kg, batch_volume_l
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    sku_id, name, None, side, arm_type.value, is_boxed,
+                    l, w, h, weight_kg, raw_vol, eff_vol, rotation,
+                    rotation, 0.0, 10, round(10 * weight_kg, 2), round(10 * eff_vol, 2)
+                ),
+            )
+        print(f"РўРѕРІР°СЂ {sku_id} Р·Р±РµСЂРµР¶РµРЅРѕ!", flush=True)
+        return self.lookup_sku(sku_id)
+
+    def get_stock_info(self, sku_id: str, unit_weight: float, unit_vol: float) -> dict:
+        inv_row = self.conn.execute(
+            """
+            SELECT i.slot_id, i.quantity, s.max_weight_kg, s.current_weight_kg,
+                   s.max_volume_l, s.current_volume_l
+            FROM inventory i
+            JOIN shelves s ON i.slot_id = s.slot_id
+            WHERE i.sku_id = ?
+            """,
+            (sku_id,),
+        ).fetchone()
+
+        over_row = self.conn.execute(
+            "SELECT quantity FROM overstock WHERE sku_id = ?", (sku_id,)
+        ).fetchone()
+        over_qty = over_row[0] if over_row else 0
+
+        if inv_row:
+            slot_id, cur_qty, max_w, cur_w, max_v, cur_v = inv_row
+            free_w = max(0.0, (max_w * TARGET_FILL_RATIO) - cur_w)
+            free_v = max(0.0, (max_v * TARGET_FILL_RATIO) - cur_v)
+
+            fit_by_w = int(free_w // unit_weight)
+            fit_by_v = int(free_v // unit_vol) if unit_vol > 0 else 999
+            fit_pcs = min(fit_by_w, fit_by_v)
+
+            return {
+                "is_assigned": True,
+                "slot_id": slot_id,
+                "shelf_qty": cur_qty,
+                "fit_pcs": fit_pcs,
+                "overstock_qty": over_qty,
+            }
+
+        return {
+            "is_assigned": False,
+            "slot_id": None,
+            "shelf_qty": 0,
+            "fit_pcs": 0,
+            "overstock_qty": over_qty,
+        }
+
+    def find_shelf_for_new_sku(self, sku_data: tuple) -> Optional[Tuple[str, int]]:
+        sku_id, name, arm_type, is_boxed, l, w, h, weight, rot_str, eff_vol = sku_data
+        sku_rot = Rotation(rot_str)
+
+        query = """
+            SELECT slot_id, shelf_type, max_weight_kg, current_weight_kg, 
+                   max_volume_l, current_volume_l, entry_height_cm, is_boxed_only
+            FROM shelves
+            WHERE is_blocked = 0 
+              AND current_weight_kg < (max_weight_kg * 0.95)
+              AND current_volume_l < (max_volume_l * 0.95)
+            ORDER BY distance_cost ASC
+        """
+        slots = self.conn.execute(query).fetchall()
+
+        for slot in slots:
+            slot_id, shelf_type, max_w, cur_w, max_v, cur_v, entry_h, is_boxed_only = slot
+
+            if bool(is_boxed) != bool(is_boxed_only):
+                continue
+
+            if shelf_type == ShelfType.THIN_SLOT.value:
+                if not (arm_type == ArmType.STRAIGHT_LINK.value or l <= 34.0):
+                    continue
+
+            if shelf_type != ShelfType.CONTINUOUS_300.value and min(h, w) > entry_h:
+                continue
+
+            current_skus = {
+                r[0] for r in self.conn.execute(
+                    "SELECT sku_id FROM inventory WHERE slot_id = ?", (slot_id,)
+                ).fetchall()
+            }
+
+            if sku_rot == Rotation.R1 and current_skus:
+                continue
+
+            free_w = (max_w * TARGET_FILL_RATIO) - cur_w
+            free_v = (max_v * TARGET_FILL_RATIO) - cur_v
+            fit_pcs = min(int(free_w // weight), int(free_v // eff_vol))
+            if fit_pcs > 0:
+                return (slot_id, fit_pcs)
+
+        return None
+
+    def commit_placement(
+        self,
+        slot_id: Optional[str],
+        sku_id: str,
+        shelf_qty: int,
+        unit_weight: float,
+        unit_vol: float,
+        overstock_qty: int,
+        rotation: str,
+    ):
+        with self.conn:
+            if slot_id and shelf_qty > 0:
+                added_w = round(shelf_qty * unit_weight, 2)
+                added_v = round(shelf_qty * unit_vol, 2)
+
+                existing = self.conn.execute(
+                    "SELECT quantity FROM inventory WHERE sku_id = ?", (sku_id,)
+                ).fetchone()
+
+                if existing:
+                    self.conn.execute(
+                        "UPDATE inventory SET quantity = quantity + ?, slot_id = ? WHERE sku_id = ?",
+                        (shelf_qty, slot_id, sku_id),
+                    )
+                else:
+                    self.conn.execute(
+                        "INSERT INTO inventory (slot_id, sku_id, quantity) VALUES (?, ?, ?)",
+                        (slot_id, sku_id, shelf_qty),
+                    )
+
+                self.conn.execute(
+                    """
+                    UPDATE shelves 
+                    SET current_weight_kg = current_weight_kg + ?, 
+                        current_volume_l = current_volume_l + ? 
+                    WHERE slot_id = ?
+                    """,
+                    (added_w, added_v, slot_id),
+                )
+
+            if overstock_qty > 0:
+                over_w = round(overstock_qty * unit_weight, 2)
+                self.conn.execute(
+                    """
+                    INSERT INTO overstock (sku_id, quantity, total_weight_kg, rotation)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(sku_id) DO UPDATE SET 
+                        quantity = quantity + excluded.quantity,
+                        total_weight_kg = total_weight_kg + excluded.total_weight_kg
+                    """,
+                    (sku_id, overstock_qty, over_w, rotation),
+                )
+
+
+def run_motorola_terminal():
+    try:
+        scanner = MotorolaFinalScanner()
+    except Exception as e:
+        print(f"РџРћРњРР›РљРђ РџР†Р”РљР›Р®Р§Р•РќРќРЇ Р”Рћ Р‘Р”: {e}", flush=True)
+        return
+
+    print("================================", flush=True)
+    print("      MOTOROLA WMS TERMINAL     ", flush=True)
+    print("     РљРћРќРўР РћР›Р¬: Р’РђР“Рђ + РљРЈР‘РђРўРЈР Рђ  ", flush=True)
+    print("================================", flush=True)
+
+    while True:
+        try:
+            print("\n>> РЎРљРђРќРЈР’РђРќРќРЇ SKU <<", flush=True)
+            sku_input = input("РЁРўР РРҐРљРћР”: ").strip().upper()
+            if not sku_input or sku_input in ["EXIT", "QUIT"]:
+                break
+
+            sku_data = scanner.lookup_sku(sku_input)
+            if not sku_data:
+                sku_data = scanner.register_new_sku_interactive(sku_input)
+                if not sku_data:
+                    continue
+
+            sku_id, name, arm_type, is_boxed, l, w, h, weight, rot, eff_vol = sku_data
+            stock = scanner.get_stock_info(sku_id, weight, eff_vol)
+
+            print("\n" + "=" * 32, flush=True)
+            print(f" {sku_id} [{rot}]", flush=True)
+            print(f" {name[:28]}", flush=True)
+            print(f" РћР±'С”Рј 1 С€С‚: {eff_vol} Р» | Р’Р°РіР°: {weight} РєРі", flush=True)
+            print("-" * 32, flush=True)
+            print(f" РџРћР›РР¦РЇ [{stock['slot_id'] or 'РќР• РџР РР—РќРђР§Р•РќРђ'}]: {stock['shelf_qty']} С€С‚.", flush=True)
+            if stock["is_assigned"]:
+                print(f" Р’С–Р»СЊРЅРµ РјС–СЃС†Рµ (РІР°РіР°+РѕР±'С”Рј): {stock['fit_pcs']} С€С‚.", flush=True)
+            print(f" Р’ РќРђР”РЎРўРђРќР†: {stock['overstock_qty']} С€С‚.", flush=True)
+            print("=" * 32, flush=True)
+
+            qty_input = input("Рљ-РЎРўР¬ РќРђ Р РЈРљРђРҐ (Enter = 1): ").strip()
+            qty = int(qty_input) if qty_input.isdigit() and int(qty_input) > 0 else 1
+
+            if stock["is_assigned"]:
+                target_shelf = stock["slot_id"]
+                fit_pcs = stock["fit_pcs"]
+                if rot == "RN":
+                    fit_pcs = min(fit_pcs, max(0, 5 - stock["shelf_qty"]))
+
+                if fit_pcs <= 0:
+                    over_pcs = qty
+                    print("\n! РњР†РЎР¦Р• Р’РР§Р•Р РџРђРќРћ -> РЈ РќРђР”РЎРўРђРќ !", flush=True)
+                    scanner.commit_placement(None, sku_id, 0, weight, eff_vol, over_pcs, rot)
+                    continue
+                else:
+                    shelf_pcs = min(qty, fit_pcs)
+                    over_pcs = qty - shelf_pcs
+            else:
+                found = scanner.find_shelf_for_new_sku(sku_data)
+                if found:
+                    target_shelf, fit_pcs = found
+                    if rot == "RN":
+                        fit_pcs = min(fit_pcs, 5)
+                    shelf_pcs = min(qty, fit_pcs)
+                    over_pcs = qty - shelf_pcs
+                else:
+                    print("\n! РќР•РњРђР„ Р’Р†Р›Р¬РќРРҐ РџРћР›РР¦Р¬ -> РЈ РќРђР”РЎРўРђРќ !", flush=True)
+                    scanner.commit_placement(None, sku_id, 0, weight, eff_vol, qty, rot)
+                    continue
+
+            if shelf_pcs > 0:
+                print(f"\n>>> РџРћР›РР¦РЇ Р’Р†Р”Р‘РћР РЈ: [{target_shelf}] | РџРћРљР›РђРЎРўР: {shelf_pcs} С€С‚. <<<", flush=True)
+                if over_pcs > 0:
+                    print(f"Р—Р°Р»РёС€РѕРє Сѓ РЅР°РґСЃС‚Р°РЅ: {over_pcs} С€С‚.", flush=True)
+
+                while True:
+                    shelf_scan = input(f"РЎРљРђРќРЈР™РўР• [{target_shelf}]: ").strip().upper()
+                    if shelf_scan == target_shelf:
+                        scanner.commit_placement(target_shelf, sku_id, shelf_pcs, weight, eff_vol, over_pcs, rot)
+                        print("РџС–РґС‚РІРµСЂРґР¶РµРЅРѕ!", flush=True)
+                        break
+                    elif shelf_scan in ["SKIP", "CANCEL"]:
+                        break
+        except KeyboardInterrupt:
+            break
+
+
+if __name__ == "__main__":
+    run_motorola_terminal()
+
+=== FILE: C:\Users\stafi\PycharmProjects\warehouse_slotting\src\tasks.py ===
+"""
+Р“РµРЅРµСЂР°С‚РѕСЂ СЃРєР»Р°РґСЃСЊРєРёС… Р·Р°РІРґР°РЅСЊ РґР»СЏ РўРЎР” СЃРєР°РЅРµСЂС–РІ (Putaway & Overstock Routing).
+Р¤РѕСЂРјСѓС” РјР°С€РёРЅРѕС‡РёС‚Р°РЅС– С‡РµСЂРіРё РѕРїРµСЂР°С†С–Р№ РґР»СЏ С–РЅС‚РµРіСЂР°С†С–С— Р· WMS.
+"""
+
+import json
+from dataclasses import asdict, dataclass
+from enum import Enum
+from pathlib import Path
+from typing import Dict, List, Optional
+import pandas as pd
+
+from src.db import get_connection
+from src.models import Rotation
+
+TASKS_OUTPUT_PATH = Path("data/warehouse_tasks.json")
+
+
+class TaskType(str, Enum):
+    PUTAWAY_PICK_FACE = "PUTAWAY_PICK_FACE"      # Р РѕР·РјС–С‰РµРЅРЅСЏ РЅР° СЂРѕР±РѕС‡Сѓ РїРѕР»РёС†СЋ РІС–РґР±РѕСЂСѓ
+    PUTAWAY_OVERSTOCK = "PUTAWAY_OVERSTOCK"      # Р’С–РґРїСЂР°РІРєР° Р·Р°Р»РёС€РєСѓ РїР°СЂС‚С–С— РІ РЅР°РґСЃС‚Р°РЅ
+    REPLENISHMENT = "REPLENISHMENT"              # РџРѕРїРѕРІРЅРµРЅРЅСЏ РїРѕР»РёС†С– Р· РЅР°РґСЃС‚Р°РЅСѓ
+
+
+class TaskPriority(str, Enum):
+    CRITICAL = "CRITICAL"  # R1 вЂ” Р±Р»РѕРєСѓС” С€РІРёРґРєС– Р·Р°РјРѕРІР»РµРЅРЅСЏ
+    HIGH = "HIGH"          # R2
+    MEDIUM = "MEDIUM"      # R3, RN
+    LOW = "LOW"            # R4, R5
+
+
+@dataclass
+class WarehouseTask:
+    task_id: str
+    task_type: TaskType
+    priority: TaskPriority
+    sku_id: str
+    sku_name: str
+    source_location: str
+    target_location: str
+    quantity: int
+    unit_weight_kg: float
+    total_weight_kg: float
+    rotation: str
+    instruction: str
+
+
+def get_task_priority(rotation: str) -> TaskPriority:
+    """Р’РёР·РЅР°С‡Р°С” РїСЂС–РѕСЂРёС‚РµС‚ РІРёРєРѕРЅР°РЅРЅСЏ Р·Р°РІРґР°РЅРЅСЏ РґР»СЏ С‡РµСЂРіРё РўРЎР”."""
+    if rotation == Rotation.R1.value:
+        return TaskPriority.CRITICAL
+    if rotation == Rotation.R2.value:
+        return TaskPriority.HIGH
+    if rotation in [Rotation.R3.value, Rotation.RN.value]:
+        return TaskPriority.MEDIUM
+    return TaskPriority.LOW
+
+
+class TaskEngine:
+    def __init__(self):
+        self.conn = get_connection()
+        self.tasks: List[WarehouseTask] = []
+
+    def generate_receipt_tasks(self, default_source: str = "RAMP-01") -> List[WarehouseTask]:
+        """
+        Р“РµРЅРµСЂСѓС” С‡РµСЂРіСѓ Р·Р°РІРґР°РЅСЊ РЅР° СЂРѕР·РєР»Р°РґРєСѓ РЅР° РѕСЃРЅРѕРІС– Р°РєС‚СѓР°Р»СЊРЅРёС… С‚Р°Р±Р»РёС†СЊ inventory С‚Р° overstock.
+        """
+        self.tasks.clear()
+        task_seq = 1
+
+        # 1. Р—Р°РІРґР°РЅРЅСЏ РЅР° СЂРѕР·РјС–С‰РµРЅРЅСЏ РІ СЂРѕР±РѕС‡С– РїРѕР»РёС†С– РІС–РґР±РѕСЂСѓ (Pick Face)
+        query_inventory = """
+            SELECT 
+                i.sku_id,
+                s.name,
+                i.slot_id,
+                i.quantity,
+                s.weight_kg,
+                s.rotation
+            FROM inventory i
+            JOIN sku_catalog s ON i.sku_id = s.sku_id
+            ORDER BY 
+                CASE s.effective_rotation
+                    WHEN 'R1' THEN 1
+                    WHEN 'R2' THEN 2
+                    WHEN 'R3' THEN 3
+                    WHEN 'RN' THEN 4
+                    WHEN 'R4' THEN 5
+                    WHEN 'R5' THEN 6
+                END,
+                i.slot_id ASC;
+        """
+        df_inv = pd.read_sql(query_inventory, self.conn)
+
+        for _, row in df_inv.iterrows():
+            total_w = round(row["quantity"] * row["weight_kg"], 2)
+            rot = row["rotation"]
+            self.tasks.append(
+                WarehouseTask(
+                    task_id=f"TSK-{task_seq:06d}",
+                    task_type=TaskType.PUTAWAY_PICK_FACE,
+                    priority=get_task_priority(rot),
+                    sku_id=row["sku_id"],
+                    sku_name=row["name"],
+                    source_location=default_source,
+                    target_location=row["slot_id"],
+                    quantity=int(row["quantity"]),
+                    unit_weight_kg=float(row["weight_kg"]),
+                    total_weight_kg=total_w,
+                    rotation=rot,
+                    instruction=f"Р РѕР·РјС–СЃС‚РёС‚Рё {row['quantity']} С€С‚. Сѓ СЂРѕР±РѕС‡Сѓ РєРѕРјС–СЂРєСѓ {row['slot_id']}",
+                )
+            )
+            task_seq += 1
+
+        # 2. Р—Р°РІРґР°РЅРЅСЏ РЅР° РїРµСЂРµРјС–С‰РµРЅРЅСЏ РЅР°РґР»РёС€РєС–РІ Сѓ Р±СѓС„РµСЂ РЅР°РґСЃС‚Р°РЅС–РІ (Overstock)
+        query_overstock = """
+            SELECT 
+                o.sku_id,
+                s.name,
+                o.quantity,
+                o.total_weight_kg,
+                o.rotation,
+                s.weight_kg
+            FROM overstock o
+            JOIN sku_catalog s ON o.sku_id = s.sku_id
+            ORDER BY o.total_weight_kg DESC;
+        """
+        df_over = pd.read_sql(query_overstock, self.conn)
+
+        for _, row in df_over.iterrows():
+            rot = row["rotation"]
+            self.tasks.append(
+                WarehouseTask(
+                    task_id=f"TSK-{task_seq:06d}",
+                    task_type=TaskType.PUTAWAY_OVERSTOCK,
+                    priority=get_task_priority(rot),
+                    sku_id=row["sku_id"],
+                    sku_name=row["name"],
+                    source_location=default_source,
+                    target_location="OVERSTOCK-BUFFER",
+                    quantity=int(row["quantity"]),
+                    unit_weight_kg=float(row["weight_kg"]),
+                    total_weight_kg=float(row["total_weight_kg"]),
+                    rotation=rot,
+                    instruction=f"РЎРїСЂСЏРјСѓРІР°С‚Рё РЅР°РґР»РёС€РѕРє {row['quantity']} С€С‚. Сѓ РЅР°РґСЃС‚Р°РЅ (Overstock)",
+                )
+            )
+            task_seq += 1
+
+        return self.tasks
+
+    def export_tasks_json(self, file_path: Path = TASKS_OUTPUT_PATH) -> None:
+        """Р•РєСЃРїРѕСЂС‚СѓС” СЃС„РѕСЂРјРѕРІР°РЅС– Р·Р°РІРґР°РЅРЅСЏ Сѓ С„РѕСЂРјР°С‚ JSON РґР»СЏ WMS."""
+        data_to_export = [
+            {
+                **asdict(t),
+                "task_type": t.task_type.value,
+                "priority": t.priority.value,
+            }
+            for t in self.tasks
+        ]
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(data_to_export, f, ensure_ascii=False, indent=2)
+
+    def print_task_summary(self) -> None:
+        """Р’РёРІРѕРґРёС‚СЊ Р·РІС–С‚ Р·Р° С‚РёРїР°РјРё С‚Р° РїСЂС–РѕСЂРёС‚РµС‚Р°РјРё СЃС„РѕСЂРјРѕРІР°РЅРёС… Р·Р°РІРґР°РЅСЊ."""
+        total_tasks = len(self.tasks)
+        pick_tasks = sum(1 for t in self.tasks if t.task_type == TaskType.PUTAWAY_PICK_FACE)
+        over_tasks = sum(1 for t in self.tasks if t.task_type == TaskType.PUTAWAY_OVERSTOCK)
+
+        print("\n" + "=" * 55)
+        print("РЎР•Р Р’Р†РЎ Р“Р•РќР•Р РђР¦Р†Р‡ РЎРљР›РђР”РЎР¬РљРРҐ Р—РђР’Р”РђРќР¬ (WMS TASK DISPATCHER)")
+        print("=" * 55)
+        print(f"Р’СЃСЊРѕРіРѕ СЃС„РѕСЂРјРѕРІР°РЅРѕ С–РЅСЃС‚СЂСѓРєС†С–Р№: {total_tasks:,}")
+        print(f"  в”њв”Ђ Р—Р°РІРґР°РЅРЅСЏ РЅР° РїРѕР»РёС†С– (Pick Face): {pick_tasks:,}")
+        print(f"  в””в”Ђ Р—Р°РІРґР°РЅРЅСЏ РІ РЅР°РґСЃС‚Р°РЅ (Overstock): {over_tasks:,}")
+        print(f"Р•РєСЃРїРѕСЂС‚РѕРІР°РЅРѕ Сѓ С„Р°Р№Р»:             {TASKS_OUTPUT_PATH}")
+        print("=" * 55)
+
+
+if __name__ == "__main__":
+    engine = TaskEngine()
+    engine.generate_receipt_tasks()
+    engine.export_tasks_json()
+    engine.print_task_summary()
+
+=== FILE: C:\Users\stafi\PycharmProjects\warehouse_slotting\src\validator.py ===
+"""
+Р’Р°Р»С–РґР°С†С–СЏ С„С–Р·РёС‡РЅРёС… С‚Р° Р»РѕРіС–СЃС‚РёС‡РЅРёС… РѕР±РјРµР¶РµРЅСЊ РґР»СЏ РєРѕРјС–СЂРѕРє.
+"""
+
+from typing import Set, Tuple
+from src.config import MAX_SKU_PER_SLOW_BOX, MAX_SKU_PER_STANDARD_BOX
+from src.models import ArmType, Rotation, ShelfSlot, ShelfType, SuspensionArmSKU
+
+ROTATION_RANKS = {
+    Rotation.R1: 1,
+    Rotation.R2: 2,
+    Rotation.R3: 3,
+    Rotation.R4: 4,
+    Rotation.R5: 5,
+    Rotation.RN: 4,
+}
+
+SLOW_GROUP = {Rotation.R3, Rotation.R4, Rotation.R5, Rotation.RN}
+
+
+def can_pass_entry_window(sku: SuspensionArmSKU, slot: ShelfSlot) -> bool:
+    min_cross_dim = min(sku.height_cm, sku.width_cm)
+    return min_cross_dim <= slot.entry_height_cm
+
+
+def is_sku_limit_valid(sku: SuspensionArmSKU, slot: ShelfSlot, existing_skus: Set[str]) -> bool:
+    if slot.shelf_type == ShelfType.CONTINUOUS_300:
+        return True
+    if sku.sku_id in existing_skus:
+        return True
+    if sku.effective_rotation in SLOW_GROUP:
+        return len(existing_skus) < MAX_SKU_PER_SLOW_BOX
+    return len(existing_skus) < MAX_SKU_PER_STANDARD_BOX
+
+
+def is_rotation_compatible(sku: SuspensionArmSKU, existing_rotations: Set[Rotation]) -> bool:
+    if not existing_rotations:
+        return True
+    if Rotation.R1 in existing_rotations or sku.effective_rotation == Rotation.R1:
+        return False
+    if sku.effective_rotation in SLOW_GROUP and existing_rotations.issubset(SLOW_GROUP):
+        return True
+    target_rank = ROTATION_RANKS.get(sku.effective_rotation, 4)
+    for rot in existing_rotations:
+        if abs(target_rank - ROTATION_RANKS.get(rot, 4)) > 1:
+            return False
+    return True
+
+
+def validate_allocation(
+    sku: SuspensionArmSKU,
+    qty_to_place: int,
+    slot: ShelfSlot,
+    current_skus: Set[str],
+    current_rotations: Set[Rotation],
+) -> Tuple[bool, str]:
+    if slot.is_blocked:
+        return False, "РЎР»РѕС‚ Р·Р°Р±Р»РѕРєРѕРІР°РЅРѕ"
+
+    if slot.is_boxed_only and not sku.is_boxed:
+        return False, "Р›РёС€Рµ РєРѕСЂРѕР±РєРё"
+
+    if slot.shelf_type == ShelfType.THIN_SLOT:
+        # РЈ 001-009 РґРѕР·РІРѕР»РµРЅРѕ РїСЂСЏРјС– СЃС‚С–Р№РєРё (STRAIGHT_LINK) Р°Р±Рѕ РґСѓРіРѕРІС– РІР°Р¶РµР»С– (CURVED) <= 34 СЃРј
+        is_thin_compatible = (sku.arm_type == ArmType.STRAIGHT_LINK) or (
+            sku.arm_type == ArmType.CURVED and sku.length_cm <= 34.0
+        )
+        if not is_thin_compatible:
+            return False, "РЈ 001-009 РґРѕР·РІРѕР»РµРЅРѕ Р»РёС€Рµ СЃС‚С–Р№РєРё Р°Р±Рѕ РєРѕСЂРѕС‚РєС– РІР°Р¶РµР»С– <= 34 СЃРј"
+
+    if not can_pass_entry_window(sku, slot):
+        return False, "Р“Р°Р±Р°СЂРёС‚Рё РїРµСЂРµРІРёС‰СѓСЋС‚СЊ РІС–РєРЅРѕ РґРѕСЃС‚СѓРїСѓ"
+
+    added_weight = round(qty_to_place * sku.weight_kg, 2)
+    if slot.current_weight_kg + added_weight > slot.max_weight_kg:
+        return False, "РџРµСЂРµРІРёС‰РµРЅРЅСЏ Р»С–РјС–С‚Сѓ РІР°РіРё"
+
+    added_volume = round(qty_to_place * sku.effective_volume_l, 2)
+    if slot.current_volume_l + added_volume > slot.max_volume_l:
+        return False, "РџРµСЂРµРІРёС‰РµРЅРЅСЏ Р»С–РјС–С‚Сѓ РєСѓР±Р°С‚СѓСЂРё РїРѕР»РёС†С–"
+
+    if not is_sku_limit_valid(sku, slot, current_skus):
+        return False, "РџРµСЂРµРІРёС‰РµРЅРѕ Р»С–РјС–С‚ СЂС–Р·РЅРѕРІРёРґС–РІ"
+
+    if not is_rotation_compatible(sku, current_rotations):
+        return False, "РќРµСЃСѓРјС–СЃРЅС– СЂРѕС‚Р°С†С–С—"
+
+    return True, "OK"
+
+=== FILE: C:\Users\stafi\PycharmProjects\warehouse_slotting\src\__init__.py ===
+
+
+=== FILE: C:\Users\stafi\PycharmProjects\warehouse_slotting\main.py ===
+"""
+Р“РѕР»РѕРІРЅР° С‚РѕС‡РєР° РІС…РѕРґСѓ Warehouse Slotting Engine.
+РћСЂРєРµСЃС‚СЂСѓС” РµС‚Р°РїРё: РіРµРЅРµСЂР°С†С–СЏ РєР°С‚Р°Р»РѕРіСѓ -> С–РЅС–С†С–Р°Р»С–Р·Р°С†С–СЏ Р‘Р” -> РѕРїС‚РёРјС–Р·Р°С†С–СЏ СЂРѕР·РјС–С‰РµРЅРЅСЏ -> РµРєСЃРїРѕСЂС‚ Р·Р°РІРґР°РЅСЊ РґР»СЏ РўРЎР”.
+"""
+
+import argparse
+import sys
+import time
+from pathlib import Path
+
+from src.allocator import WarehouseAllocator
+from src.db import setup_database
+from src.generator import generate_suspension_dataset
+from src.tasks import TaskEngine
+
+
+def run_full_pipeline(rebuild_data: bool = False):
+    start_time = time.time()
+    print("=" * 60)
+    print("Р—РђРџРЈРЎРљ РџРђР™РџР›РђР™РќРЈ РћРџРўРРњР†Р—РђР¦Р†Р‡ РЎРљР›РђР”РЎР¬РљРћР“Рћ РЎР•РљРўРћР РЈ")
+    print("=" * 60)
+
+    # 1. Р“РµРЅРµСЂР°С†С–СЏ РєР°С‚Р°Р»РѕРіСѓ
+    csv_path = Path("data/suspension_arms.csv")
+    if rebuild_data or not csv_path.exists():
+        print("\n[РљР РћРљ 1/4] Р“РµРЅРµСЂР°С†С–СЏ РєР°С‚Р°Р»РѕРіСѓ SKU...")
+        df_sku = generate_suspension_dataset()
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        df_sku.to_csv(csv_path, index=False, encoding="utf-8")
+        print(f"-> РљР°С‚Р°Р»РѕРі РѕРЅРѕРІР»РµРЅРѕ: {len(df_sku):,} SKU")
+    else:
+        print(f"\n[РљР РћРљ 1/4] Р’РёРєРѕСЂРёСЃС‚Р°РЅРЅСЏ РЅР°СЏРІРЅРѕРіРѕ РєР°С‚Р°Р»РѕРіСѓ: {csv_path}")
+
+    # 2. РЎРёРЅС…СЂРѕРЅС–Р·Р°С†С–СЏ С‚РѕРїРѕР»РѕРіС–С‡РЅРѕС— РєР°СЂС‚Рё
+    print("\n[РљР РћРљ 2/4] РЎРёРЅС…СЂРѕРЅС–Р·Р°С†С–СЏ С‚РѕРїРѕР»РѕРіС–С‡РЅРѕС— РєР°СЂС‚Рё СЃРµРєС‚РѕСЂСѓ...")
+    setup_database()
+
+    # 3. Р РѕР·РїРѕРґС–Р» РґРµС‚Р°Р»РµР№
+    print("\n[РљР РћРљ 3/4] Р РѕР·СЂР°С…СѓРЅРѕРє РѕРїС‚РёРјР°Р»СЊРЅРѕРіРѕ СЂРѕР·РјС–С‰РµРЅРЅСЏ...")
+    allocator = WarehouseAllocator()
+    allocator.allocate()
+    allocator.save_results()
+    allocator.print_summary()
+    allocator.close()
+
+    # 4. Р¤РѕСЂРјСѓРІР°РЅРЅСЏ Р·Р°РІРґР°РЅСЊ
+    print("\n[РљР РћРљ 4/4] Р¤РѕСЂРјСѓРІР°РЅРЅСЏ РїСѓР»Сѓ С–РЅСЃС‚СЂСѓРєС†С–Р№ РґР»СЏ РўРЎР” СЃРєР°РЅРµСЂС–РІ...")
+    task_engine = TaskEngine()
+    task_engine.generate_receipt_tasks()
+    task_engine.export_tasks_json()
+    task_engine.print_task_summary()
+    task_engine.conn.close()
+
+    elapsed = round(time.time() - start_time, 2)
+    print(f"\n РџР°Р№РїР»Р°Р№РЅ СѓСЃРїС–С€РЅРѕ РІРёРєРѕРЅР°РЅРѕ Р·Р° {elapsed} СЃРµРє.")
+    print("=" * 60)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Warehouse Slotting Engine")
+    parser.add_argument("--run-all", action="store_true")
+    parser.add_argument("--rebuild-catalog", action="store_true")
+    parser.add_argument("--tasks-only", action="store_true")
+
+    args = parser.parse_args()
+
+    if len(sys.argv) == 1 or args.run_all:
+        run_full_pipeline(rebuild_data=args.rebuild_catalog)
+    elif args.tasks_only:
+        task_engine = TaskEngine()
+        task_engine.generate_receipt_tasks()
+        task_engine.export_tasks_json()
+        task_engine.print_task_summary()
+        task_engine.conn.close()
+
+
+if __name__ == "__main__":
+    main()
+
